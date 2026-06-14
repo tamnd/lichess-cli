@@ -14,144 +14,216 @@ import (
 //
 //	import _ "github.com/tamnd/lichess-cli/lichess"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// lichess:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone lichess binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The init below registers it; the host then dereferences lichess:// URIs by
+// routing to the operations Register installs. The same Domain also builds the
+// standalone lichess binary (see cli.NewApp), so the binary and a host share
+// one source of truth.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the lichess driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "lichess",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "lichess",
-			Short:  "A command line for lichess.",
-			Long: `A command line for lichess.
+			Short:  "Browse public Lichess chess data from the command line.",
+			Long: `A command line for Lichess (lichess.org/api).
 
-lichess reads public lichess data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+lichess reads public chess data over plain HTTPS, shapes it into clean records,
+and prints output that pipes into the rest of your tools. No API key, nothing to
+run alongside it.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/lichess-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `lichess page` and
-	// `ant get lichess://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// user: player profile
+	kit.Handle(app, kit.OpMeta{Name: "user", Group: "player", Single: true,
+		Summary: "Fetch a player profile", URIType: "user", Resolver: true,
+		Args: []kit.Arg{{Name: "username", Help: "Lichess username"}}}, getUser)
 
-	// List op: members of a page, the home of `lichess links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// lichess://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// perf: performance statistics
+	kit.Handle(app, kit.OpMeta{Name: "perf", Group: "player", Single: true,
+		Summary: "Fetch performance stats for a player",
+		Args:    []kit.Arg{{Name: "username", Help: "Lichess username"}}}, getPerfStat)
+
+	// puzzle: daily puzzle
+	kit.Handle(app, kit.OpMeta{Name: "puzzle", Group: "content", Single: true,
+		Summary: "Fetch the daily puzzle"}, getPuzzle)
+
+	// games: recent games (NDJSON stream)
+	kit.Handle(app, kit.OpMeta{Name: "games", Group: "content", List: true,
+		Summary: "List recent games for a player",
+		Args:    []kit.Arg{{Name: "username", Help: "Lichess username"}}}, listGames)
+
+	// tv: current TV game
+	kit.Handle(app, kit.OpMeta{Name: "tv", Group: "content", Single: true,
+		Summary: "Fetch the current TV game"}, getTV)
+
+	// top: leaderboard
+	kit.Handle(app, kit.OpMeta{Name: "top", Group: "content", List: true,
+		Summary: "Fetch the leaderboard for a perf type"}, listTop)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := NewClient(DefaultConfig())
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		c.cfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		c.cfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		c.cfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.cfg.Timeout = cfg.Timeout
+		c.http.Timeout = cfg.Timeout
 	}
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input types ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type usernameIn struct {
+	Username string  `kit:"arg" help:"Lichess username"`
+	Client   *Client `kit:"inject"`
+}
+
+type perfIn struct {
+	Username string  `kit:"arg" help:"Lichess username"`
+	Type     string  `kit:"flag" help:"perf type: bullet blitz rapid classical"`
+	Client   *Client `kit:"inject"`
+}
+
+type gamesIn struct {
+	Username string  `kit:"arg" help:"Lichess username"`
+	Limit    int     `kit:"flag,inherit" help:"max games"`
+	Perf     string  `kit:"flag" help:"perf filter: bullet blitz rapid classical"`
+	Client   *Client `kit:"inject"`
+}
+
+type topIn struct {
+	Limit  int     `kit:"flag,inherit" help:"number of players"`
+	Perf   string  `kit:"flag" help:"perf type: bullet blitz rapid classical"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type noArgs struct {
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func getUser(ctx context.Context, in usernameIn, emit func(*User) error) error {
+	u, err := in.Client.GetUser(ctx, in.Username)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(u)
+}
+
+func getPerfStat(ctx context.Context, in perfIn, emit func(*PerfStat) error) error {
+	perfType := in.Type
+	if perfType == "" {
+		perfType = "blitz"
+	}
+	ps, err := in.Client.GetPerfStat(ctx, in.Username, perfType)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(ps)
+}
+
+func getPuzzle(ctx context.Context, in noArgs, emit func(*Puzzle) error) error {
+	p, err := in.Client.GetPuzzle(ctx)
 	if err != nil {
 		return mapErr(err)
 	}
 	return emit(p)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func listGames(ctx context.Context, in gamesIn, emit func(*Game) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	games, err := in.Client.GetGames(ctx, in.Username, limit, in.Perf)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range games {
+		if err := emit(&games[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func getTV(ctx context.Context, in noArgs, emit func(*TVGame) error) error {
+	tv, err := in.Client.GetTV(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(tv)
+}
 
-// Classify turns any accepted input — a bare path or a full lichess.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+func listTop(ctx context.Context, in topIn, emit func(*LeaderEntry) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+	perfType := in.Perf
+	if perfType == "" {
+		perfType = "bullet"
+	}
+	entries, err := in.Client.GetLeaderboard(ctx, limit, perfType)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range entries {
+		if err := emit(&entries[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- URI driver ---
+
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
 	id = pagePath(input)
 	if id == "" {
 		return "", "", errs.Usage("unrecognized lichess reference: %q", input)
 	}
-	return "page", id, nil
+	return "user", id, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "user":
+		return "https://" + Host + "/@/" + strings.Trim(id, "/"), nil
+	default:
 		return "", errs.Usage("lichess has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
 func pagePath(input string) string {
 	input = strings.TrimSpace(input)
 	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
@@ -160,14 +232,6 @@ func pagePath(input string) string {
 	return strings.Trim(input, "/")
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
 func mapErr(err error) error {
 	return err
 }

@@ -1,62 +1,439 @@
 // Package lichess is the library behind the lichess command line:
-// the HTTP client, request shaping, and the typed data models for lichess.
+// the HTTP client, request shaping, and the typed data models for Lichess.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package lichess
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to lichess. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "lichess/dev (+https://github.com/tamnd/lichess-cli)"
+// DefaultUserAgent identifies the client to Lichess.
+const DefaultUserAgent = "lichess-cli/0.1.0 (github.com/tamnd/lichess-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at lichess.com; change it once you
-// know the real endpoints you want to read.
-const Host = "lichess.com"
+// Host is the site this client talks to.
+const Host = "lichess.org"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://" + Host + "/api"
 
-// Client talks to lichess over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunables for the client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns a Config with sensible defaults for the Lichess API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to Lichess over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client with the given config.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// --- Domain types ---
+
+// User is a Lichess player profile.
+type User struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	Title       string `json:"title,omitempty"`
+	BulletRating int   `json:"bullet_rating,omitempty"`
+	BlitzRating  int   `json:"blitz_rating,omitempty"`
+	RapidRating  int   `json:"rapid_rating,omitempty"`
+	ClassRating  int   `json:"classical_rating,omitempty"`
+	TotalGames  int    `json:"total_games"`
+	WinCount    int    `json:"win_count"`
+	Patron      bool   `json:"patron,omitempty"`
+	Verified    bool   `json:"verified,omitempty"`
+}
+
+// PerfStat is performance statistics for one perf type.
+type PerfStat struct {
+	Username   string  `json:"username"`
+	PerfType   string  `json:"perf_type"`
+	Games      int     `json:"games"`
+	Wins       int     `json:"wins"`
+	Losses     int     `json:"losses"`
+	Draws      int     `json:"draws"`
+	Rating     int     `json:"rating,omitempty"`
+	Rank       int     `json:"rank,omitempty"`
+	Percentile float64 `json:"percentile,omitempty"`
+	WinStreak  int     `json:"win_streak,omitempty"`
+	PlayStreak int     `json:"play_streak,omitempty"`
+}
+
+// Puzzle is the daily Lichess puzzle.
+type Puzzle struct {
+	ID       string   `json:"id"`
+	Rating   int      `json:"rating"`
+	Plays    int      `json:"plays"`
+	Solution []string `json:"solution"`
+	Themes   []string `json:"themes"`
+	GameID   string   `json:"game_id"`
+}
+
+// Game is one Lichess game record.
+type Game struct {
+	ID            string `json:"id"`
+	Status        string `json:"status"`
+	Speed         string `json:"speed"`
+	Variant       string `json:"variant"`
+	WhiteUsername string `json:"white_username"`
+	BlackUsername string `json:"black_username"`
+	WhiteRating   int    `json:"white_rating,omitempty"`
+	BlackRating   int    `json:"black_rating,omitempty"`
+	Moves         string `json:"moves,omitempty"`
+	Winner        string `json:"winner,omitempty"`
+}
+
+// TVGame is the current Lichess TV broadcast game.
+type TVGame struct {
+	ID          string `json:"id"`
+	FEN         string `json:"fen"`
+	Color       string `json:"color"`
+	Speed       string `json:"speed"`
+	WhitePlayer string `json:"white_player"`
+	BlackPlayer string `json:"black_player"`
+	WhiteRating int    `json:"white_rating,omitempty"`
+	BlackRating int    `json:"black_rating,omitempty"`
+}
+
+// LeaderEntry is one entry in a Lichess leaderboard.
+type LeaderEntry struct {
+	Rank     int    `json:"rank"`
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Title    string `json:"title,omitempty"`
+	Rating   int    `json:"rating"`
+}
+
+// --- internal API response types ---
+
+type apiUser struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Title    string `json:"title"`
+	Perfs    struct {
+		Bullet    apiPerf `json:"bullet"`
+		Blitz     apiPerf `json:"blitz"`
+		Rapid     apiPerf `json:"rapid"`
+		Classical apiPerf `json:"classical"`
+	} `json:"perfs"`
+	Count struct {
+		All int `json:"all"`
+		Win int `json:"win"`
+	} `json:"count"`
+	Patron   bool `json:"patron"`
+	Verified bool `json:"verified"`
+}
+
+type apiPerf struct {
+	Games  int `json:"games"`
+	Rating int `json:"rating"`
+}
+
+type apiPerfStat struct {
+	Stat struct {
+		Count struct {
+			All  int `json:"all"`
+			Win  int `json:"win"`
+			Loss int `json:"loss"`
+			Draw int `json:"draw"`
+		} `json:"count"`
+		ResultStreak struct {
+			Win struct {
+				Cur struct {
+					V int `json:"v"`
+				} `json:"cur"`
+			} `json:"win"`
+		} `json:"resultStreak"`
+		PlayStreak struct {
+			Nb struct {
+				V int `json:"v"`
+			} `json:"nb"`
+		} `json:"playStreak"`
+	} `json:"stat"`
+	Rank       int     `json:"rank"`
+	Percentile float64 `json:"percentile"`
+}
+
+type apiPuzzleResp struct {
+	Puzzle struct {
+		ID       string   `json:"id"`
+		Rating   int      `json:"rating"`
+		Plays    int      `json:"plays"`
+		Solution []string `json:"solution"`
+		Themes   []string `json:"themes"`
+	} `json:"puzzle"`
+	Game struct {
+		ID string `json:"id"`
+	} `json:"game"`
+}
+
+type apiGame struct {
+	ID      string `json:"id"`
+	Status  string `json:"status"`
+	Speed   string `json:"speed"`
+	Variant string `json:"variant"`
+	Players struct {
+		White apiPlayer `json:"white"`
+		Black apiPlayer `json:"black"`
+	} `json:"players"`
+	Moves  string `json:"moves"`
+	Winner string `json:"winner"`
+}
+
+type apiPlayer struct {
+	User   struct{ Name string `json:"name"` } `json:"user"`
+	Rating int                                  `json:"rating"`
+}
+
+type apiTV struct {
+	ID      string `json:"id"`
+	FEN     string `json:"fen"`
+	Color   string `json:"color"`
+	Speed   string `json:"speed"`
+	Players struct {
+		White apiPlayer `json:"white"`
+		Black apiPlayer `json:"black"`
+	} `json:"players"`
+}
+
+type apiLeaderboard struct {
+	Users []apiLeaderUser `json:"users"`
+}
+
+type apiLeaderUser struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Title    string `json:"title"`
+	Perfs    map[string]struct {
+		Rating int `json:"rating"`
+	} `json:"perfs"`
+}
+
+// --- Client methods ---
+
+// GetUser fetches a player profile by username.
+func (c *Client) GetUser(ctx context.Context, username string) (*User, error) {
+	u := fmt.Sprintf("%s/user/%s", c.cfg.BaseURL, url.PathEscape(username))
+	body, err := c.get(ctx, u, "")
+	if err != nil {
+		return nil, err
+	}
+	var api apiUser
+	if err := json.Unmarshal(body, &api); err != nil {
+		return nil, fmt.Errorf("decode user: %w", err)
+	}
+	return &User{
+		ID:          api.ID,
+		Username:    api.Username,
+		Title:       api.Title,
+		BulletRating: api.Perfs.Bullet.Rating,
+		BlitzRating:  api.Perfs.Blitz.Rating,
+		RapidRating:  api.Perfs.Rapid.Rating,
+		ClassRating:  api.Perfs.Classical.Rating,
+		TotalGames:  api.Count.All,
+		WinCount:    api.Count.Win,
+		Patron:      api.Patron,
+		Verified:    api.Verified,
+	}, nil
+}
+
+// GetPerfStat fetches performance statistics for a player and perf type.
+func (c *Client) GetPerfStat(ctx context.Context, username, perfType string) (*PerfStat, error) {
+	if perfType == "" {
+		perfType = "blitz"
+	}
+	u := fmt.Sprintf("%s/user/%s/perf/%s", c.cfg.BaseURL, url.PathEscape(username), perfType)
+	body, err := c.get(ctx, u, "")
+	if err != nil {
+		return nil, err
+	}
+	var api apiPerfStat
+	if err := json.Unmarshal(body, &api); err != nil {
+		return nil, fmt.Errorf("decode perf stat: %w", err)
+	}
+	return &PerfStat{
+		Username:   username,
+		PerfType:   perfType,
+		Games:      api.Stat.Count.All,
+		Wins:       api.Stat.Count.Win,
+		Losses:     api.Stat.Count.Loss,
+		Draws:      api.Stat.Count.Draw,
+		Rank:       api.Rank,
+		Percentile: api.Percentile,
+		WinStreak:  api.Stat.ResultStreak.Win.Cur.V,
+		PlayStreak: api.Stat.PlayStreak.Nb.V,
+	}, nil
+}
+
+// GetPuzzle fetches the daily puzzle.
+func (c *Client) GetPuzzle(ctx context.Context) (*Puzzle, error) {
+	u := fmt.Sprintf("%s/puzzle/daily", c.cfg.BaseURL)
+	body, err := c.get(ctx, u, "")
+	if err != nil {
+		return nil, err
+	}
+	var api apiPuzzleResp
+	if err := json.Unmarshal(body, &api); err != nil {
+		return nil, fmt.Errorf("decode puzzle: %w", err)
+	}
+	return &Puzzle{
+		ID:       api.Puzzle.ID,
+		Rating:   api.Puzzle.Rating,
+		Plays:    api.Puzzle.Plays,
+		Solution: api.Puzzle.Solution,
+		Themes:   api.Puzzle.Themes,
+		GameID:   api.Game.ID,
+	}, nil
+}
+
+// GetGames fetches recent games for a player as NDJSON.
+func (c *Client) GetGames(ctx context.Context, username string, limit int, perfType string) ([]Game, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	q := url.Values{}
+	q.Set("max", fmt.Sprintf("%d", limit))
+	if perfType != "" && perfType != "all" {
+		q.Set("perfType", perfType)
+	}
+	u := fmt.Sprintf("%s/games/user/%s?%s", c.cfg.BaseURL, url.PathEscape(username), q.Encode())
+	body, err := c.get(ctx, u, "application/x-ndjson")
+	if err != nil {
+		return nil, err
+	}
+	return parseNDJSON(body)
+}
+
+// GetTV fetches the current TV game.
+func (c *Client) GetTV(ctx context.Context) (*TVGame, error) {
+	u := fmt.Sprintf("%s/tv/current", c.cfg.BaseURL)
+	body, err := c.get(ctx, u, "")
+	if err != nil {
+		return nil, err
+	}
+	var api apiTV
+	if err := json.Unmarshal(body, &api); err != nil {
+		return nil, fmt.Errorf("decode tv: %w", err)
+	}
+	return &TVGame{
+		ID:          api.ID,
+		FEN:         api.FEN,
+		Color:       api.Color,
+		Speed:       api.Speed,
+		WhitePlayer: api.Players.White.User.Name,
+		BlackPlayer: api.Players.Black.User.Name,
+		WhiteRating: api.Players.White.Rating,
+		BlackRating: api.Players.Black.Rating,
+	}, nil
+}
+
+// GetLeaderboard fetches the leaderboard for a perf type.
+func (c *Client) GetLeaderboard(ctx context.Context, nb int, perfType string) ([]LeaderEntry, error) {
+	if nb <= 0 {
+		nb = 5
+	}
+	if perfType == "" {
+		perfType = "bullet"
+	}
+	u := fmt.Sprintf("%s/leaderboard/%d/%s", c.cfg.BaseURL, nb, perfType)
+	body, err := c.get(ctx, u, "")
+	if err != nil {
+		return nil, err
+	}
+	var api apiLeaderboard
+	if err := json.Unmarshal(body, &api); err != nil {
+		return nil, fmt.Errorf("decode leaderboard: %w", err)
+	}
+	entries := make([]LeaderEntry, 0, len(api.Users))
+	for i, u := range api.Users {
+		rating := 0
+		if p, ok := u.Perfs[perfType]; ok {
+			rating = p.Rating
+		}
+		entries = append(entries, LeaderEntry{
+			Rank:     i + 1,
+			ID:       u.ID,
+			Username: u.Username,
+			Title:    u.Title,
+			Rating:   rating,
+		})
+	}
+	return entries, nil
+}
+
+// --- NDJSON parsing ---
+
+func parseNDJSON(body []byte) ([]Game, error) {
+	var games []Game
+	sc := bufio.NewScanner(bytes.NewReader(body))
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var api apiGame
+		if err := json.Unmarshal(line, &api); err != nil {
+			return nil, fmt.Errorf("decode game line: %w", err)
+		}
+		games = append(games, Game{
+			ID:            api.ID,
+			Status:        api.Status,
+			Speed:         api.Speed,
+			Variant:       api.Variant,
+			WhiteUsername: api.Players.White.User.Name,
+			BlackUsername: api.Players.Black.User.Name,
+			WhiteRating:   api.Players.White.Rating,
+			BlackRating:   api.Players.Black.Rating,
+			Moves:         api.Moves,
+			Winner:        api.Winner,
+		})
+	}
+	return games, sc.Err()
+}
+
+// --- HTTP layer ---
+
+func (c *Client) get(ctx context.Context, u string, accept string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +441,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, u, accept)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +450,21 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", u, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, u string, accept string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -104,30 +484,25 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
 func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
+	return min(time.Duration(attempt)*500*time.Millisecond, 5*time.Second)
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on lichess.com. It is a stand-in for the typed records you
-// will model from the real lichess endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `lichess cat` and the Markdown export print.
+// --- scaffold compatibility: Page type kept for domain.go ---
+
+// Page is used by the kit domain driver as the URI-addressable resource.
 type Page struct {
 	ID    string `json:"id" kit:"id"`
 	URL   string `json:"url"`
@@ -135,36 +510,32 @@ type Page struct {
 	Body  string `json:"body,omitempty" kit:"body"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// GetPage fetches one page by its path.
+func (c *Client) GetPage(ctx context.Context, p string) (*Page, error) {
+	p = strings.Trim(p, "/")
+	u := "https://" + Host + "/" + p
+	body, err := c.get(ctx, u, "")
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	return &Page{ID: p, URL: u, Title: p, Body: pageText(body)}, nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// PageLinks is kept for the kit domain driver.
+func (c *Client) PageLinks(ctx context.Context, p string, limit int) ([]*Page, error) {
+	p = strings.Trim(p, "/")
+	body, err := c.get(ctx, "https://"+Host+"/"+p, "")
 	if err != nil {
 		return nil, err
 	}
 	var out []*Page
 	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
+	for _, lp := range linkPaths(body) {
+		if seen[lp] {
 			continue
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
+		seen[lp] = true
+		out = append(out, &Page{ID: lp, URL: "https://" + Host + "/" + lp})
 		if limit > 0 && len(out) >= limit {
 			break
 		}
@@ -172,29 +543,50 @@ func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
 func linkPaths(body []byte) []string {
+	// simple href extractor for scaffold compatibility
 	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+	s := string(body)
+	for {
+		i := strings.Index(s, `href="`)
+		if i < 0 {
+			break
+		}
+		s = s[i+6:]
+		j := strings.IndexByte(s, '"')
+		if j < 0 {
+			break
+		}
+		p := s[:j]
+		s = s[j:]
+		if strings.HasPrefix(p, "/") && !strings.ContainsAny(p, "#?:") {
+			p = strings.Trim(p, "/")
+			if p != "" {
+				out = append(out, p)
+			}
 		}
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
 func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+	s := string(body)
+	// strip tags
+	out := make([]byte, 0, len(s))
+	inTag := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '<' {
+			inTag = true
+		} else if s[i] == '>' {
+			inTag = false
+			out = append(out, ' ')
+		} else if !inTag {
+			out = append(out, s[i])
+		}
 	}
-	return s
+	r := strings.Join(strings.Fields(string(out)), " ")
+	if len(r) > 500 {
+		r = r[:500]
+	}
+	return r
 }
