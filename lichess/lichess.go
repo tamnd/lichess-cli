@@ -69,17 +69,16 @@ func NewClient(cfg Config) *Client {
 
 // User is a Lichess player profile.
 type User struct {
-	ID          string `json:"id"`
-	Username    string `json:"username"`
-	Title       string `json:"title,omitempty"`
-	BulletRating int   `json:"bullet_rating,omitempty"`
-	BlitzRating  int   `json:"blitz_rating,omitempty"`
-	RapidRating  int   `json:"rapid_rating,omitempty"`
-	ClassRating  int   `json:"classical_rating,omitempty"`
-	TotalGames  int    `json:"total_games"`
-	WinCount    int    `json:"win_count"`
-	Patron      bool   `json:"patron,omitempty"`
-	Verified    bool   `json:"verified,omitempty"`
+	Username     string `kit:"id" json:"username"`
+	Title        string `json:"title,omitempty"`
+	URL          string `json:"url,omitempty"`
+	BulletRating int    `json:"bullet_rating,omitempty"`
+	BlitzRating  int    `json:"blitz_rating,omitempty"`
+	RapidRating  int    `json:"rapid_rating,omitempty"`
+	TotalGames   int    `json:"total_games"`
+	WinCount     int    `json:"wins"`
+	LossCount    int    `json:"losses"`
+	DrawCount    int    `json:"draws"`
 }
 
 // PerfStat is performance statistics for one perf type.
@@ -99,26 +98,22 @@ type PerfStat struct {
 
 // Puzzle is the daily Lichess puzzle.
 type Puzzle struct {
-	ID       string   `json:"id"`
-	Rating   int      `json:"rating"`
-	Plays    int      `json:"plays"`
-	Solution []string `json:"solution"`
-	Themes   []string `json:"themes"`
-	GameID   string   `json:"game_id"`
+	ID       string `kit:"id" json:"id"`
+	Rating   int    `json:"rating"`
+	Plays    int    `json:"plays"`
+	Themes   string `json:"themes"`   // comma-joined
+	Solution string `json:"solution"` // space-joined moves
 }
 
 // Game is one Lichess game record.
 type Game struct {
-	ID            string `json:"id"`
-	Status        string `json:"status"`
-	Speed         string `json:"speed"`
-	Variant       string `json:"variant"`
-	WhiteUsername string `json:"white_username"`
-	BlackUsername string `json:"black_username"`
-	WhiteRating   int    `json:"white_rating,omitempty"`
-	BlackRating   int    `json:"black_rating,omitempty"`
-	Moves         string `json:"moves,omitempty"`
-	Winner        string `json:"winner,omitempty"`
+	ID      string `kit:"id" json:"id"`
+	White   string `json:"white"`   // white player name
+	Black   string `json:"black"`   // black player name
+	Winner  string `json:"winner"`  // "white", "black", or ""
+	Status  string `json:"status"`  // status.name
+	Variant string `json:"variant"` // speed/perf name
+	Moves   string `json:"moves"`   // first 20 space-separated moves
 }
 
 // TVGame is the current Lichess TV broadcast game.
@@ -133,14 +128,15 @@ type TVGame struct {
 	BlackRating int    `json:"black_rating,omitempty"`
 }
 
-// LeaderEntry is one entry in a Lichess leaderboard.
-type LeaderEntry struct {
-	Rank     int    `json:"rank"`
-	ID       string `json:"id"`
-	Username string `json:"username"`
+// TopPlayer is one entry in a Lichess leaderboard.
+type TopPlayer struct {
+	Username string `kit:"id" json:"username"`
 	Title    string `json:"title,omitempty"`
 	Rating   int    `json:"rating"`
 }
+
+// LeaderEntry is an alias kept for backward compat within this package.
+type LeaderEntry = TopPlayer
 
 // --- internal API response types ---
 
@@ -155,11 +151,14 @@ type apiUser struct {
 		Classical apiPerf `json:"classical"`
 	} `json:"perfs"`
 	Count struct {
-		All int `json:"all"`
-		Win int `json:"win"`
+		All  int `json:"all"`
+		Win  int `json:"win"`
+		Loss int `json:"loss"`
+		Draw int `json:"draw"`
 	} `json:"count"`
-	Patron   bool `json:"patron"`
-	Verified bool `json:"verified"`
+	URL      string `json:"url"`
+	Patron   bool   `json:"patron"`
+	Verified bool   `json:"verified"`
 }
 
 type apiPerf struct {
@@ -261,17 +260,16 @@ func (c *Client) GetUser(ctx context.Context, username string) (*User, error) {
 		return nil, fmt.Errorf("decode user: %w", err)
 	}
 	return &User{
-		ID:          api.ID,
-		Username:    api.Username,
-		Title:       api.Title,
+		Username:     api.Username,
+		Title:        api.Title,
+		URL:          api.URL,
 		BulletRating: api.Perfs.Bullet.Rating,
 		BlitzRating:  api.Perfs.Blitz.Rating,
 		RapidRating:  api.Perfs.Rapid.Rating,
-		ClassRating:  api.Perfs.Classical.Rating,
-		TotalGames:  api.Count.All,
-		WinCount:    api.Count.Win,
-		Patron:      api.Patron,
-		Verified:    api.Verified,
+		TotalGames:   api.Count.All,
+		WinCount:     api.Count.Win,
+		LossCount:    api.Count.Loss,
+		DrawCount:    api.Count.Draw,
 	}, nil
 }
 
@@ -318,9 +316,28 @@ func (c *Client) GetPuzzle(ctx context.Context) (*Puzzle, error) {
 		ID:       api.Puzzle.ID,
 		Rating:   api.Puzzle.Rating,
 		Plays:    api.Puzzle.Plays,
-		Solution: api.Puzzle.Solution,
-		Themes:   api.Puzzle.Themes,
-		GameID:   api.Game.ID,
+		Themes:   strings.Join(api.Puzzle.Themes, ","),
+		Solution: strings.Join(api.Puzzle.Solution, " "),
+	}, nil
+}
+
+// GetPuzzleByID fetches a puzzle by its ID.
+func (c *Client) GetPuzzleByID(ctx context.Context, id string) (*Puzzle, error) {
+	u := fmt.Sprintf("%s/puzzle/%s", c.cfg.BaseURL, url.PathEscape(id))
+	body, err := c.get(ctx, u, "")
+	if err != nil {
+		return nil, err
+	}
+	var api apiPuzzleResp
+	if err := json.Unmarshal(body, &api); err != nil {
+		return nil, fmt.Errorf("decode puzzle: %w", err)
+	}
+	return &Puzzle{
+		ID:       api.Puzzle.ID,
+		Rating:   api.Puzzle.Rating,
+		Plays:    api.Puzzle.Plays,
+		Themes:   strings.Join(api.Puzzle.Themes, ","),
+		Solution: strings.Join(api.Puzzle.Solution, " "),
 	}, nil
 }
 
@@ -373,7 +390,7 @@ func (c *Client) GetLeaderboard(ctx context.Context, nb int, perfType string) ([
 	if perfType == "" {
 		perfType = "bullet"
 	}
-	u := fmt.Sprintf("%s/leaderboard/%d/%s", c.cfg.BaseURL, nb, perfType)
+	u := fmt.Sprintf("%s/player/top/%d/%s", c.cfg.BaseURL, nb, perfType)
 	body, err := c.get(ctx, u, "")
 	if err != nil {
 		return nil, err
@@ -383,14 +400,12 @@ func (c *Client) GetLeaderboard(ctx context.Context, nb int, perfType string) ([
 		return nil, fmt.Errorf("decode leaderboard: %w", err)
 	}
 	entries := make([]LeaderEntry, 0, len(api.Users))
-	for i, u := range api.Users {
+	for _, u := range api.Users {
 		rating := 0
 		if p, ok := u.Perfs[perfType]; ok {
 			rating = p.Rating
 		}
 		entries = append(entries, LeaderEntry{
-			Rank:     i + 1,
-			ID:       u.ID,
 			Username: u.Username,
 			Title:    u.Title,
 			Rating:   rating,
@@ -414,19 +429,25 @@ func parseNDJSON(body []byte) ([]Game, error) {
 			return nil, fmt.Errorf("decode game line: %w", err)
 		}
 		games = append(games, Game{
-			ID:            api.ID,
-			Status:        api.Status,
-			Speed:         api.Speed,
-			Variant:       api.Variant,
-			WhiteUsername: api.Players.White.User.Name,
-			BlackUsername: api.Players.Black.User.Name,
-			WhiteRating:   api.Players.White.Rating,
-			BlackRating:   api.Players.Black.Rating,
-			Moves:         api.Moves,
-			Winner:        api.Winner,
+			ID:      api.ID,
+			White:   api.Players.White.User.Name,
+			Black:   api.Players.Black.User.Name,
+			Winner:  api.Winner,
+			Status:  api.Status,
+			Variant: api.Speed, // use speed as the variant label
+			Moves:   first20Moves(api.Moves),
 		})
 	}
 	return games, sc.Err()
+}
+
+// first20Moves returns the first 20 space-separated tokens from a moves string.
+func first20Moves(moves string) string {
+	parts := strings.Fields(moves)
+	if len(parts) > 20 {
+		parts = parts[:20]
+	}
+	return strings.Join(parts, " ")
 }
 
 // --- HTTP layer ---

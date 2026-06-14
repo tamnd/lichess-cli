@@ -22,13 +22,14 @@ const fakeUserJSON = `{
   "id": "drnykterstein",
   "username": "DrNykterstein",
   "title": "GM",
+  "url": "https://lichess.org/@/DrNykterstein",
   "perfs": {
     "bullet":    {"games": 10450, "rating": 3270},
     "blitz":     {"games": 7893,  "rating": 3151},
     "rapid":     {"games": 100,   "rating": 2900},
     "classical": {"games": 20,    "rating": 2800}
   },
-  "count": {"all": 10450, "win": 5678},
+  "count": {"all": 10450, "win": 5678, "loss": 3000, "draw": 772},
   "patron": false,
   "verified": true
 }`
@@ -54,25 +55,14 @@ const fakePuzzleJSON = `{
   "game": {"id": "kRSCJTml"}
 }`
 
-const fakeGamesNDJSON = `{"id":"g1","status":"mate","speed":"bullet","variant":"standard","players":{"white":{"user":{"name":"DrNykterstein"},"rating":3270},"black":{"user":{"name":"Opponent"},"rating":3200}},"moves":"e4 e5","winner":"white"}
+const fakeGamesNDJSON = `{"id":"g1","status":"mate","speed":"bullet","variant":"standard","players":{"white":{"user":{"name":"DrNykterstein"},"rating":3270},"black":{"user":{"name":"Opponent"},"rating":3200}},"moves":"e4 e5 Nf3 Nc6 Bb5 a6","winner":"white"}
 {"id":"g2","status":"resign","speed":"blitz","variant":"standard","players":{"white":{"user":{"name":"Opponent"},"rating":3200},"black":{"user":{"name":"DrNykterstein"},"rating":3270}},"moves":"d4 d5","winner":"black"}
 `
 
-const fakeTVJSON = `{
-  "id": "kRSCJTml",
-  "fen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq",
-  "color": "white",
-  "speed": "bullet",
-  "players": {
-    "white": {"user": {"name": "DrNykterstein"}, "rating": 3270},
-    "black": {"user": {"name": "Opponent"},      "rating": 3200}
-  }
-}`
-
 const fakeLeaderboardJSON = `{
   "users": [
-    {"id":"drnykterstein","username":"DrNykterstein","title":"GM","perfs":{"bullet":{"rating":3270}}},
-    {"id":"gmopponent","username":"GMOpponent","title":"GM","perfs":{"bullet":{"rating":3200}}}
+    {"id":"drnykterstein","username":"DrNykterstein","title":"GM","perfs":{"blitz":{"rating":3270}}},
+    {"id":"gmopponent","username":"GMOpponent","title":"GM","perfs":{"blitz":{"rating":3200}}}
   ]
 }`
 
@@ -102,14 +92,14 @@ func TestGetUserParsesProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.ID != "drnykterstein" {
-		t.Errorf("ID = %q, want drnykterstein", u.ID)
-	}
 	if u.Username != "DrNykterstein" {
 		t.Errorf("Username = %q, want DrNykterstein", u.Username)
 	}
 	if u.Title != "GM" {
 		t.Errorf("Title = %q, want GM", u.Title)
+	}
+	if u.URL != "https://lichess.org/@/DrNykterstein" {
+		t.Errorf("URL = %q", u.URL)
 	}
 	if u.BulletRating != 3270 {
 		t.Errorf("BulletRating = %d, want 3270", u.BulletRating)
@@ -120,17 +110,17 @@ func TestGetUserParsesProfile(t *testing.T) {
 	if u.RapidRating != 2900 {
 		t.Errorf("RapidRating = %d, want 2900", u.RapidRating)
 	}
-	if u.ClassRating != 2800 {
-		t.Errorf("ClassRating = %d, want 2800", u.ClassRating)
-	}
 	if u.TotalGames != 10450 {
 		t.Errorf("TotalGames = %d, want 10450", u.TotalGames)
 	}
 	if u.WinCount != 5678 {
 		t.Errorf("WinCount = %d, want 5678", u.WinCount)
 	}
-	if !u.Verified {
-		t.Error("Verified should be true")
+	if u.LossCount != 3000 {
+		t.Errorf("LossCount = %d, want 3000", u.LossCount)
+	}
+	if u.DrawCount != 772 {
+		t.Errorf("DrawCount = %d, want 772", u.DrawCount)
 	}
 }
 
@@ -194,17 +184,30 @@ func TestGetPuzzleParsesDaily(t *testing.T) {
 	if p.Plays != 90081 {
 		t.Errorf("Plays = %d, want 90081", p.Plays)
 	}
-	if len(p.Solution) != 5 {
-		t.Errorf("Solution len = %d, want 5", len(p.Solution))
+	if p.Solution != "d1d7 g7f6 d7b7 b8b7 c7b7" {
+		t.Errorf("Solution = %q, want space-joined moves", p.Solution)
 	}
-	if p.Solution[0] != "d1d7" {
-		t.Errorf("Solution[0] = %q, want d1d7", p.Solution[0])
+	if p.Themes != "crushing,endgame,long" {
+		t.Errorf("Themes = %q, want comma-joined themes", p.Themes)
 	}
-	if len(p.Themes) != 3 {
-		t.Errorf("Themes len = %d, want 3", len(p.Themes))
+}
+
+func TestGetPuzzleByID(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/puzzle/DJWZM") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = fmt.Fprint(w, fakePuzzleJSON)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	p, err := c.GetPuzzleByID(context.Background(), "DJWZM")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if p.GameID != "kRSCJTml" {
-		t.Errorf("GameID = %q, want kRSCJTml", p.GameID)
+	if p.ID != "DJWZM" {
+		t.Errorf("ID = %q, want DJWZM", p.ID)
 	}
 }
 
@@ -227,16 +230,23 @@ func TestGetGamesNDJSON(t *testing.T) {
 	if g0.ID != "g1" {
 		t.Errorf("g0.ID = %q, want g1", g0.ID)
 	}
-	if g0.WhiteUsername != "DrNykterstein" {
-		t.Errorf("g0.WhiteUsername = %q", g0.WhiteUsername)
+	if g0.White != "DrNykterstein" {
+		t.Errorf("g0.White = %q, want DrNykterstein", g0.White)
 	}
-	if g0.WhiteRating != 3270 {
-		t.Errorf("g0.WhiteRating = %d, want 3270", g0.WhiteRating)
+	if g0.Black != "Opponent" {
+		t.Errorf("g0.Black = %q, want Opponent", g0.Black)
 	}
 	if g0.Winner != "white" {
 		t.Errorf("g0.Winner = %q, want white", g0.Winner)
 	}
-	if g0.Moves != "e4 e5" {
+	if g0.Status != "mate" {
+		t.Errorf("g0.Status = %q, want mate", g0.Status)
+	}
+	if g0.Variant != "bullet" {
+		t.Errorf("g0.Variant = %q, want bullet", g0.Variant)
+	}
+	// moves should be first 20 space-separated tokens
+	if g0.Moves != "e4 e5 Nf3 Nc6 Bb5 a6" {
 		t.Errorf("g0.Moves = %q", g0.Moves)
 	}
 	if games[1].ID != "g2" {
@@ -251,7 +261,7 @@ func TestGetLeaderboardParsesEntries(t *testing.T) {
 	defer ts.Close()
 
 	c := newTestClient(ts)
-	entries, err := c.GetLeaderboard(context.Background(), 5, "bullet")
+	entries, err := c.GetLeaderboard(context.Background(), 5, "blitz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,9 +269,6 @@ func TestGetLeaderboardParsesEntries(t *testing.T) {
 		t.Fatalf("want 2 entries, got %d", len(entries))
 	}
 	e0 := entries[0]
-	if e0.Rank != 1 {
-		t.Errorf("Rank = %d, want 1", e0.Rank)
-	}
 	if e0.Username != "DrNykterstein" {
 		t.Errorf("Username = %q", e0.Username)
 	}

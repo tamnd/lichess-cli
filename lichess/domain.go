@@ -58,9 +58,10 @@ func (Domain) Register(app *kit.App) {
 		Summary: "Fetch performance stats for a player",
 		Args:    []kit.Arg{{Name: "username", Help: "Lichess username"}}}, getPerfStat)
 
-	// puzzle: daily puzzle
+	// puzzle: daily puzzle or by ID
 	kit.Handle(app, kit.OpMeta{Name: "puzzle", Group: "content", Single: true,
-		Summary: "Fetch the daily puzzle"}, getPuzzle)
+		Summary: "Fetch the daily puzzle or a puzzle by ID",
+		Args:    []kit.Arg{{Name: "id", Help: "puzzle ID (omit for daily)", Optional: true}}}, getPuzzle)
 
 	// games: recent games (NDJSON stream)
 	kit.Handle(app, kit.OpMeta{Name: "games", Group: "content", List: true,
@@ -108,17 +109,22 @@ type perfIn struct {
 	Client   *Client `kit:"inject"`
 }
 
+type puzzleIn struct {
+	ID     string  `kit:"arg,optional" help:"puzzle ID (omit for daily)"`
+	Client *Client `kit:"inject"`
+}
+
 type gamesIn struct {
 	Username string  `kit:"arg" help:"Lichess username"`
 	Limit    int     `kit:"flag,inherit" help:"max games"`
-	Perf     string  `kit:"flag" help:"perf filter: bullet blitz rapid classical"`
+	Variant  string  `kit:"flag" help:"variant filter: bullet blitz rapid"`
 	Client   *Client `kit:"inject"`
 }
 
 type topIn struct {
-	Limit  int     `kit:"flag,inherit" help:"number of players"`
-	Perf   string  `kit:"flag" help:"perf type: bullet blitz rapid classical"`
-	Client *Client `kit:"inject"`
+	Limit   int     `kit:"flag,inherit" help:"number of players"`
+	Variant string  `kit:"flag" help:"variant: bullet blitz rapid classical puzzle"`
+	Client  *Client `kit:"inject"`
 }
 
 type noArgs struct {
@@ -147,8 +153,17 @@ func getPerfStat(ctx context.Context, in perfIn, emit func(*PerfStat) error) err
 	return emit(ps)
 }
 
-func getPuzzle(ctx context.Context, in noArgs, emit func(*Puzzle) error) error {
-	p, err := in.Client.GetPuzzle(ctx)
+func getPuzzle(ctx context.Context, in puzzleIn, emit func(*Puzzle) error) error {
+	var (
+		p   *Puzzle
+		err error
+	)
+	id := strings.TrimSpace(in.ID)
+	if id == "" || id == "daily" {
+		p, err = in.Client.GetPuzzle(ctx)
+	} else {
+		p, err = in.Client.GetPuzzleByID(ctx, id)
+	}
 	if err != nil {
 		return mapErr(err)
 	}
@@ -160,7 +175,7 @@ func listGames(ctx context.Context, in gamesIn, emit func(*Game) error) error {
 	if limit <= 0 {
 		limit = 10
 	}
-	games, err := in.Client.GetGames(ctx, in.Username, limit, in.Perf)
+	games, err := in.Client.GetGames(ctx, in.Username, limit, in.Variant)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -180,16 +195,16 @@ func getTV(ctx context.Context, in noArgs, emit func(*TVGame) error) error {
 	return emit(tv)
 }
 
-func listTop(ctx context.Context, in topIn, emit func(*LeaderEntry) error) error {
+func listTop(ctx context.Context, in topIn, emit func(*TopPlayer) error) error {
 	limit := in.Limit
 	if limit <= 0 {
-		limit = 5
+		limit = 10
 	}
-	perfType := in.Perf
-	if perfType == "" {
-		perfType = "bullet"
+	variant := in.Variant
+	if variant == "" {
+		variant = "blitz"
 	}
-	entries, err := in.Client.GetLeaderboard(ctx, limit, perfType)
+	entries, err := in.Client.GetLeaderboard(ctx, limit, variant)
 	if err != nil {
 		return mapErr(err)
 	}
