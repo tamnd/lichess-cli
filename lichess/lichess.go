@@ -218,8 +218,10 @@ type apiGame struct {
 }
 
 type apiPlayer struct {
-	User   struct{ Name string `json:"name"` } `json:"user"`
-	Rating int                                  `json:"rating"`
+	User struct {
+		Name string `json:"name"`
+	} `json:"user"`
+	Rating int `json:"rating"`
 }
 
 type apiTV struct {
