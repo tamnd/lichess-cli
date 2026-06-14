@@ -53,7 +53,7 @@ func TestHostWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	u := &User{ID: "drnykterstein", Username: "DrNykterstein"}
+	u := &User{Username: "DrNykterstein"}
 	_, err = h.Mint(u)
 	// Mint may fail if User doesn't carry kit tags; that's acceptable for now.
 	// We just verify no panic.
